@@ -14,25 +14,31 @@ const queue = [];
 let busy = false;
 
 sf.postMessage('uci');
-sf.postMessage('setoption name MultiPV value 1');
+sf.postMessage('setoption name MultiPV value 5'); 
 sf.postMessage('setoption name Threads value 4');
 sf.postMessage('setoption name UCI_LimitStrength value true');
 sf.postMessage('isready');
 
+let pvMoves = {};
+
 sf.onmessage = (e) => {
     const msg = typeof e === 'string' ? e : e.data;
 
-    if (msg.includes(' multipv 1 ') && msg.includes(' pv ')) {
+    if (msg.includes(' pv ')) {
+        const multipvMatch = msg.match(/ multipv (\d+) /);
         const pvPart = msg.split(' pv ')[1];
-        if (pvPart) bestFromPv = pvPart.trim().split(' ')[0];
+        if (multipvMatch && pvPart) {
+            const rank = parseInt(multipvMatch[1]);
+            pvMoves[rank] = pvPart.trim().split(' ')[0];
+        }
     }
 
     if (msg.startsWith('bestmove')) {
         const best = msg.split(' ')[1];
         if (resolver) {
-            resolver(bestFromPv || best);
+            resolver({ pvMoves: { ...pvMoves }, best });
             resolver = null;
-            bestFromPv = null;
+            pvMoves = {};
         }
     }
 };
@@ -44,24 +50,69 @@ function getMove(fen, depth) {
             reject(new Error('timeout'));
         }, 15000);
 
-        resolver = (move) => {
+        resolver = (result) => {
             clearTimeout(t);
-            resolve(move);
+            resolve(result);
         };
 
-        bestFromPv = null;
+        pvMoves = {};
         sf.postMessage('position fen ' + fen);
         sf.postMessage('go depth ' + depth);
     });
 }
 
+function humanPickMove(elo, pvMoves, best, fen) {
+    const chess = new Chess(fen);
+    const legalMoves = chess.moves({ verbose: true }).map(m => m.from + m.to + (m.promotion || ''));
+    const candidates = [];
+    for (let i = 1; i <= 5; i++) {
+        if (pvMoves[i]) candidates.push(pvMoves[i]);
+    }
+    if (candidates.length === 0) candidates.push(best);
+    const weightProfiles = {
+        400:  [20, 20, 20, 20, 20],  
+        600:  [30, 25, 20, 15, 10],
+        800:  [40, 28, 18, 10,  4],
+        1000: [55, 25, 12,  6,  2],
+        1200: [65, 20, 10,  4,  1],
+        1500: [75, 15,  7,  2,  1],
+        1800: [85, 10,  4,  1,  0],
+        2000: [92,  6,  2,  0,  0],
+        2200: [96,  3,  1,  0,  0],
+        2500: [98,  2,  0,  0,  0],
+        3190: [100, 0,  0,  0,  0],
+    };
+    const brackets = Object.keys(weightProfiles).map(Number).sort((a, b) => a - b);
+    let bracket = brackets[0];
+    for (const b of brackets) {
+        if (elo >= b) bracket = b;
+    }
+    const weights = weightProfiles[bracket];
+    const blunderChance = Math.max(0, (1500 - elo) / 1500) * 0.30;
+
+    if (Math.random() < blunderChance) {
+        
+        const randomMove = legalMoves[Math.floor(Math.random() * legalMoves.length)];
+        return randomMove;
+    }
+    const totalWeight = weights.slice(0, candidates.length).reduce((a, b) => a + b, 0);
+    let rand = Math.random() * totalWeight;
+    for (let i = 0; i < candidates.length; i++) {
+        rand -= weights[i];
+        if (rand <= 0) return candidates[i];
+    }
+
+    return candidates[0]; 
+}
+
 async function processQueue() {
     if (busy || !queue.length) return;
     busy = true;
-    const { fen, depth, eloForOption, resolve, reject } = queue.shift();
+    const { fen, depth, elo, eloForOption, resolve, reject } = queue.shift();
     try {
         sf.postMessage('setoption name UCI_Elo value ' + eloForOption);
-        const move = await getMove(fen, depth);
+        const result = await getMove(fen, depth);
+        const move = humanPickMove(elo, result.pvMoves, result.best, fen);
         resolve(move);
     } catch (e) {
         reject(e);
@@ -70,9 +121,9 @@ async function processQueue() {
     processQueue();
 }
 
-function enqueue(fen, depth, eloForOption) {
+function enqueue(fen, depth, elo, eloForOption) {
     return new Promise((resolve, reject) => {
-        queue.push({ fen, depth, eloForOption, resolve, reject });
+        queue.push({ fen, depth, elo, eloForOption, resolve, reject });
         processQueue();
     });
 }
@@ -121,7 +172,7 @@ app.post('/bestmove', async (req, res) => {
 
         const clampedElo = Math.min(Math.max(elo, 1320), 3190);
         const depth = eloToDepth(elo);
-        const bestmove = await enqueue(position, depth, clampedElo);
+        const bestmove = await enqueue(position, depth, elo, clampedElo);
 
         res.json({ elo, depth, bestmove });
     } catch (e) {
@@ -129,4 +180,4 @@ app.post('/bestmove', async (req, res) => {
     }
 });
 
-app.listen(8567);
+app.listen(30293);
