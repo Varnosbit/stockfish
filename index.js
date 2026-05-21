@@ -1,100 +1,147 @@
 'use strict';
-//by allou Mohamed 
-//sfv ^10.0.2
+
 const express = require('express');
-const { Worker, isMainThread, parentPort } = require('worker_threads');
 const { Chess } = require('chess.js');
 const stockfish = require('stockfish');
-
-if (!isMainThread) {
-    const sf = stockfish();
-    let lines = [];
-
-    function pickMoveFromLines() {
-        const pv = lines
-            .filter(l => l.includes(' pv '))
-            .pop();
-
-        if (pv) {
-            const parts = pv.split(' pv ')[1].trim().split(' ');
-            return parts[0];
-        }
-
-        return null;
-    }
-
-    sf.onmessage = (e) => {
-        const msg = typeof e === 'string' ? e : e.data;
-
-        if (msg.startsWith('bestmove')) {
-            const best = msg.split(' ')[1];
-            const fallback = pickMoveFromLines();
-            parentPort.postMessage(fallback || best);
-        }
-
-        if (msg.includes(' pv ')) {
-            lines.push(msg);
-        }
-    };
-
-    parentPort.on('message', ({ fen, depth }) => {
-        lines = [];
-        sf.postMessage('uci');
-        sf.postMessage('setoption name MultiPV value 5');
-        sf.postMessage('position fen ' + fen);
-        sf.postMessage('go depth ' + depth);
-    });
-
-    return;
-}
 
 const app = express();
 app.use(express.json());
 
-const WORKERS = 4;
-const pool = Array.from({ length: WORKERS }, () => new Worker(__filename));
-let i = 0;
+const sf = stockfish();
+let bestFromPv = null;
+let resolver = null;
+const queue = [];
+let busy = false;
+
+sf.onmessage = (e) => {
+    const msg = typeof e === 'string' ? e : e.data;
+
+    if (msg.includes(' multipv 1 ') && msg.includes(' pv ')) {
+        const pvPart = msg.split(' pv ')[1];
+        if (pvPart) bestFromPv = pvPart.trim().split(' ')[0];
+    }
+
+    if (msg.startsWith('bestmove')) {
+        const best = msg.split(' ')[1];
+        if (resolver) {
+            resolver(bestFromPv || best);
+            resolver = null;
+            bestFromPv = null;
+        }
+    }
+};
+
+function getMove(fen, depth) {
+    return new Promise((resolve, reject) => {
+        const t = setTimeout(() => {
+            resolver = null;
+            reject(new Error('timeout'));
+        }, 15000);
+
+        resolver = (move) => {
+            clearTimeout(t);
+            resolve(move);
+        };
+
+        bestFromPv = null;
+        sf.postMessage('position fen ' + fen);
+        sf.postMessage('go depth ' + depth);
+    });
+}
+
+async function processQueue() {
+    if (busy || !queue.length) return;
+    busy = true;
+    const { fen, depth, resolve, reject } = queue.shift();
+    try {
+        const move = await getMove(fen, depth);
+        resolve(move);
+    } catch (e) {
+        reject(e);
+    }
+    busy = false;
+    processQueue();
+}
+
+function enqueue(fen, depth) {
+    return new Promise((resolve, reject) => {
+        queue.push({ fen, depth, resolve, reject });
+        processQueue();
+    });
+}
 
 function eloToDepth(elo) {
-    if (elo <= 400) return 1;
-    if (elo <= 800) return 2;
+    if (elo <= 400)  return 1;
+    if (elo <= 800)  return 2;
     if (elo <= 1200) return 4;
     if (elo <= 1500) return 6;
     if (elo <= 1800) return 8;
     if (elo <= 2000) return 10;
-    return 14;
+    if (elo <= 2200) return 14;
+    if (elo <= 2500) return 16;
+    return 20;
 }
 
-function runWorker(fen, depth) {
-    return new Promise((resolve, reject) => {
-        const w = pool[i = (i + 1) % WORKERS];
-        const t = setTimeout(() => reject(new Error('timeout')), 10000);
-        w.once('message', (m) => {
-            clearTimeout(t);
-            resolve(m);
-        });
-        w.postMessage({ fen, depth });
-    });
+function isValidFen(fen) {
+    try { new Chess(fen); return true; }
+    catch { return false; }
 }
 
 function pgnToFen(pgn) {
     const chess = new Chess();
-    chess.load_pgn(pgn);
+    chess.loadPgn(pgn);
     return chess.fen();
 }
+
+function initEngine() {
+    return new Promise((resolve) => {
+        const originalHandler = sf.onmessage;
+        sf.onmessage = (e) => {
+            const msg = typeof e === 'string' ? e : e.data;
+            if (msg === 'readyok') {
+                sf.onmessage = originalHandler;
+                resolve();
+            }
+        };
+        sf.postMessage('uci');
+        sf.postMessage('setoption name MultiPV value 1');
+        sf.postMessage('setoption name Threads value 4');
+        sf.postMessage('setoption name UCI_LimitStrength value true');
+        sf.postMessage('isready');
+    });
+}
+
+app.get('/health', (req, res) => {
+    res.json({ status: 'ok', queue: queue.length, busy });
+});
 
 app.post('/bestmove', async (req, res) => {
     try {
         const { fen, pgn, elo = 1200 } = req.body;
+
+        if (!fen && !pgn) return res.status(400).json({ error: 'fen or pgn required' });
+
+        let position;
+        if (pgn) {
+            try { position = pgnToFen(pgn); }
+            catch { return res.status(400).json({ error: 'invalid pgn' }); }
+        } else {
+            if (!isValidFen(fen)) return res.status(400).json({ error: 'invalid fen' });
+            position = fen;
+        }
+
+        const clampedElo = Math.min(Math.max(elo, 1320), 3190);
+        sf.postMessage(`setoption name UCI_Elo value ${clampedElo}`);
+
         const depth = eloToDepth(elo);
-        const position = pgn ? pgnToFen(pgn) : fen;
-        const bestmove = await runWorker(position, depth);
+        const bestmove = await enqueue(position, depth);
+
         res.json({ elo, depth, bestmove });
     } catch (e) {
         res.status(500).json({ error: e.message });
     }
 });
 
-app.listen(3000, () => {
-   console.log("8==============================D");//😂
+initEngine().then(() => {
+    app.listen(8567);
 });
