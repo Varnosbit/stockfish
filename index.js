@@ -13,6 +13,12 @@ let resolver = null;
 const queue = [];
 let busy = false;
 
+sf.postMessage('uci');
+sf.postMessage('setoption name MultiPV value 1');
+sf.postMessage('setoption name Threads value 4');
+sf.postMessage('setoption name UCI_LimitStrength value true');
+sf.postMessage('isready');
+
 sf.onmessage = (e) => {
     const msg = typeof e === 'string' ? e : e.data;
 
@@ -52,8 +58,9 @@ function getMove(fen, depth) {
 async function processQueue() {
     if (busy || !queue.length) return;
     busy = true;
-    const { fen, depth, resolve, reject } = queue.shift();
+    const { fen, depth, eloForOption, resolve, reject } = queue.shift();
     try {
+        sf.postMessage('setoption name UCI_Elo value ' + eloForOption);
         const move = await getMove(fen, depth);
         resolve(move);
     } catch (e) {
@@ -63,9 +70,9 @@ async function processQueue() {
     processQueue();
 }
 
-function enqueue(fen, depth) {
+function enqueue(fen, depth, eloForOption) {
     return new Promise((resolve, reject) => {
-        queue.push({ fen, depth, resolve, reject });
+        queue.push({ fen, depth, eloForOption, resolve, reject });
         processQueue();
     });
 }
@@ -93,24 +100,6 @@ function pgnToFen(pgn) {
     return chess.fen();
 }
 
-function initEngine() {
-    return new Promise((resolve) => {
-        const originalHandler = sf.onmessage;
-        sf.onmessage = (e) => {
-            const msg = typeof e === 'string' ? e : e.data;
-            if (msg === 'readyok') {
-                sf.onmessage = originalHandler;
-                resolve();
-            }
-        };
-        sf.postMessage('uci');
-        sf.postMessage('setoption name MultiPV value 1');
-        sf.postMessage('setoption name Threads value 4');
-        sf.postMessage('setoption name UCI_LimitStrength value true');
-        sf.postMessage('isready');
-    });
-}
-
 app.get('/health', (req, res) => {
     res.json({ status: 'ok', queue: queue.length, busy });
 });
@@ -131,10 +120,8 @@ app.post('/bestmove', async (req, res) => {
         }
 
         const clampedElo = Math.min(Math.max(elo, 1320), 3190);
-        sf.postMessage(`setoption name UCI_Elo value ${clampedElo}`);
-
         const depth = eloToDepth(elo);
-        const bestmove = await enqueue(position, depth);
+        const bestmove = await enqueue(position, depth, clampedElo);
 
         res.json({ elo, depth, bestmove });
     } catch (e) {
@@ -142,6 +129,4 @@ app.post('/bestmove', async (req, res) => {
     }
 });
 
-initEngine().then(() => {
-    app.listen(8567);
-});
+app.listen(8567);
