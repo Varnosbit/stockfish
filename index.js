@@ -13,27 +13,70 @@ const stockfish = require('stockfish');
 if (!isMainThread) {
     const sf = stockfish();
     let resolveMove = null;
+    let ready = false;
+    const queue = [];
+
+    function flushQueue() {
+        if (queue.length === 0) return;
+        const { fen, depth } = queue.shift();
+        sf.postMessage('stop');
+        sf.postMessage('ucinewgame');
+        sf.postMessage('position fen ' + fen);
+        sf.postMessage('go depth ' + depth);
+    }
 
     sf.onmessage = (e) => {
         const msg = typeof e === 'string' ? e : e.data;
 
-        if (msg.startsWith('bestmove') && resolveMove) {
-            const best = msg.split(' ')[1];
-            const cb = resolveMove;
-            resolveMove = null;
-            cb(best && best !== '(none)' ? best : null);
+        // Step 1 — engine identified itself
+        if (msg === 'uciok') {
+            sf.postMessage('setoption name Hash value 8');
+            sf.postMessage('setoption name Threads value 1');
+            sf.postMessage('setoption name MultiPV value 1');
+            sf.postMessage('isready');
+            return;
+        }
+
+        // Step 2 — engine is ready to accept positions
+        if (msg === 'readyok') {
+            ready = true;
+            flushQueue();
+            return;
+        }
+
+        // Step 3 — engine finished searching
+        if (msg.startsWith('bestmove')) {
+            const move = msg.split(' ')[1];
+            if (resolveMove) {
+                const cb = resolveMove;
+                resolveMove = null;
+                cb(move && move !== '(none)' ? move : null);
+            }
+            // if more jobs queued, process next after a tick
+            if (queue.length > 0) {
+                setImmediate(() => {
+                    sf.postMessage('isready');
+                });
+            }
         }
     };
 
+    // Boot the engine once on worker start
     sf.postMessage('uci');
-    sf.postMessage('setoption name Hash value 8');       // 8 MB hash — safe for weak hosts
-    sf.postMessage('setoption name Threads value 1');    // 1 thread per worker
-    sf.postMessage('setoption name MultiPV value 1');    // single best line only
 
     parentPort.on('message', ({ fen, depth }) => {
         resolveMove = (move) => parentPort.postMessage(move);
-        sf.postMessage('position fen ' + fen);
-        sf.postMessage('go depth ' + depth);
+        if (ready) {
+            // mark busy so no concurrent jobs land on same worker
+            ready = false;
+            sf.postMessage('stop');
+            sf.postMessage('ucinewgame');
+            sf.postMessage('isready');
+            queue.push({ fen, depth });
+        } else {
+            // engine still booting, queue it
+            queue.push({ fen, depth });
+        }
     });
 
     return;
@@ -41,8 +84,6 @@ if (!isMainThread) {
 
 /* ─────────────────────────────────────────────
    LRU CACHE  (pure JS, zero dependencies)
-   Keeps the N most-recently-used FEN+depth
-   results so repeated positions are instant.
 ───────────────────────────────────────────── */
 class LRUCache {
     constructor(max = 512) {
@@ -53,7 +94,6 @@ class LRUCache {
     get(key) {
         if (!this.map.has(key)) return undefined;
         const val = this.map.get(key);
-        // refresh recency
         this.map.delete(key);
         this.map.set(key, val);
         return val;
@@ -62,7 +102,6 @@ class LRUCache {
     set(key, val) {
         if (this.map.has(key)) this.map.delete(key);
         else if (this.map.size >= this.max) {
-            // evict oldest entry
             this.map.delete(this.map.keys().next().value);
         }
         this.map.set(key, val);
@@ -73,14 +112,25 @@ const cache = new LRUCache(512);
 
 /* ─────────────────────────────────────────────
    WORKER POOL
-   Reduced to 2 workers on weak hosts.
-   Each worker owns one Stockfish instance.
 ───────────────────────────────────────────── */
 const WORKERS = 2;
 const pool = Array.from({ length: WORKERS }, () => new Worker(__filename));
 const busy = new Array(WORKERS).fill(false);
 
-// Round-robin that skips busy workers; falls back to least-loaded
+// Crash recovery — restart a dead worker automatically
+pool.forEach((w, idx) => {
+    w.on('error', (err) => {
+        console.error(`[worker ${idx}] error:`, err.message);
+    });
+    w.on('exit', (code) => {
+        if (code !== 0) {
+            console.warn(`[worker ${idx}] exited (${code}), restarting…`);
+            pool[idx] = new Worker(__filename);
+            busy[idx] = false;
+        }
+    });
+});
+
 function pickWorker() {
     for (let i = 0; i < WORKERS; i++) {
         if (!busy[i]) return i;
@@ -93,10 +143,12 @@ function runWorker(fen, depth) {
         const idx = pickWorker();
         busy[idx] = true;
 
+        // timeout scales with depth so deep searches don't false-fire
+        const timeoutMs = 5000 + depth * 1500;
         const timer = setTimeout(() => {
             busy[idx] = false;
             reject(new Error('Stockfish timeout'));
-        }, 12000);
+        }, timeoutMs);
 
         pool[idx].once('message', (move) => {
             clearTimeout(timer);
@@ -121,7 +173,6 @@ function eloToDepth(elo) {
     return 14;
 }
 
-// Validate a FEN string cheaply before sending to Stockfish
 function isValidFen(fen) {
     if (typeof fen !== 'string') return false;
     const parts = fen.trim().split(/\s+/);
@@ -130,7 +181,6 @@ function isValidFen(fen) {
 
 function pgnToFen(pgn) {
     const chess = new Chess();
-    // loadPgn throws on bad input — let it bubble up
     chess.loadPgn(pgn);
     return chess.fen();
 }
@@ -139,28 +189,22 @@ function pgnToFen(pgn) {
    EXPRESS APP
 ───────────────────────────────────────────── */
 const app = express();
-
-// Limit body size — nobody should POST more than 32 KB of PGN
 app.use(express.json({ limit: '32kb' }));
 
-// Simple in-process rate limiter (no extra packages)
-const rateMap = new Map(); // ip → { count, resetAt }
-const RATE_LIMIT = 30;     // requests per window
-const RATE_WINDOW = 60_000; // 1 minute
+/* ── Rate limiter (no extra packages) ── */
+const rateMap = new Map();
+const RATE_LIMIT  = 30;
+const RATE_WINDOW = 60_000;
 
 function rateLimited(ip) {
     const now = Date.now();
     let entry = rateMap.get(ip);
-
     if (!entry || now > entry.resetAt) {
-        entry = { count: 1, resetAt: now + RATE_WINDOW };
-        rateMap.set(ip, entry);
+        rateMap.set(ip, { count: 1, resetAt: now + RATE_WINDOW });
         return false;
     }
-
     entry.count++;
-    if (entry.count > RATE_LIMIT) return true;
-    return false;
+    return entry.count > RATE_LIMIT;
 }
 
 // Purge stale rate-limit entries every 5 minutes
@@ -169,16 +213,14 @@ setInterval(() => {
     for (const [ip, e] of rateMap) {
         if (now > e.resetAt) rateMap.delete(ip);
     }
-}, 300_000).unref(); // .unref() so this doesn't keep the process alive
+}, 300_000).unref();
 
 /* ── POST /bestmove ── */
 app.post('/bestmove', async (req, res) => {
-    const ip = req.ip;
-    if (rateLimited(ip)) {
+    if (rateLimited(req.ip)) {
         return res.status(429).json({ error: 'Too many requests — slow down.' });
     }
 
-    let fen;
     try {
         const { fen: rawFen, pgn, elo = 1200 } = req.body;
 
@@ -186,22 +228,25 @@ app.post('/bestmove', async (req, res) => {
             return res.status(400).json({ error: 'Provide fen or pgn.' });
         }
 
-        fen = pgn ? pgnToFen(pgn) : rawFen.trim();
+        let fen;
+        try {
+            fen = pgn ? pgnToFen(pgn) : rawFen.trim();
+        } catch {
+            return res.status(400).json({ error: 'Invalid PGN / FEN.' });
+        }
 
         if (!isValidFen(fen)) {
             return res.status(400).json({ error: 'Invalid FEN.' });
         }
 
-        const depth = eloToDepth(Number(elo) || 1200);
+        const depth    = eloToDepth(Number(elo) || 1200);
         const cacheKey = `${fen}|${depth}`;
 
-        // ── Cache hit ──────────────────────────────
         const cached = cache.get(cacheKey);
         if (cached) {
             return res.json({ elo, depth, bestmove: cached, cached: true });
         }
 
-        // ── Compute ────────────────────────────────
         const bestmove = await runWorker(fen, depth);
 
         if (!bestmove) {
@@ -220,11 +265,11 @@ app.post('/bestmove', async (req, res) => {
 /* ── GET /health ── */
 app.get('/health', (_req, res) => {
     res.json({
-        status: 'ok',
-        workers: WORKERS,
-        busy: busy.filter(Boolean).length,
+        status   : 'ok',
+        workers  : WORKERS,
+        busy     : busy.filter(Boolean).length,
         cacheSize: cache.map.size,
-        memMB: Math.round(process.memoryUsage().rss / 1024 / 1024),
+        memMB    : Math.round(process.memoryUsage().rss / 1024 / 1024),
     });
 });
 
